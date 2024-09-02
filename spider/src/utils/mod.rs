@@ -85,36 +85,51 @@ async fn cf_handle(
     let cnf = CF_MOCK_FRAME.as_ref();
 
     if b.ends_with(cf) || b.ends_with(cf2) || b.starts_with(cn) && b.ends_with(cnf) {
-        let mut wait_for = WaitFor::default();
-        wait_for.delay = WaitForDelay::new(Some(core::time::Duration::from_secs(1))).into();
-        wait_for.idle_network =
-            WaitForIdleNetwork::new(core::time::Duration::from_secs(8).into()).into();
-        page_wait(&page, &Some(wait_for.clone())).await;
+        let page_result = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+            let mut wait_for = WaitFor::default();
+            wait_for.delay = WaitForDelay::new(Some(core::time::Duration::from_secs(1))).into();
+            wait_for.idle_network =
+                WaitForIdleNetwork::new(core::time::Duration::from_secs(8).into()).into();
+            page_wait(&page, &Some(wait_for.clone())).await;
 
-        let _ = page
-            .evaluate(r###"document.querySelectorAll("iframe").forEach(el=>el.click());"###)
-            .await;
+            let _ = page
+                .evaluate(r###"document.querySelectorAll("iframe").forEach(el=>el.click());"###)
+                .await;
 
-        wait_for.page_navigations = true;
-        page_wait(&page, &Some(wait_for.clone())).await;
+            wait_for.page_navigations = true;
+            page_wait(&page, &Some(wait_for.clone())).await;
 
-        let next_content = page.content_bytes().await?;
+            match page.content_bytes().await {
+                Ok(next_content) => {
+                    let next_content = if next_content.ends_with(cf)
+                        || next_content.ends_with(cf2)
+                        || next_content.starts_with(cn) && next_content.ends_with(cnf)
+                    {
+                        wait_for.delay =
+                            WaitForDelay::new(Some(core::time::Duration::from_secs(4))).into();
+                        page_wait(&page, &Some(wait_for)).await;
+                        match page.content_bytes().await {
+                            Ok(nc) => nc,
+                            _ => next_content,
+                        }
+                    } else {
+                        next_content
+                    };
 
-        let next_content = if next_content.ends_with(cf)
-            || next_content.ends_with(cf2)
-            || next_content.starts_with(cn) && next_content.ends_with(cnf)
-        {
-            wait_for.delay = WaitForDelay::new(Some(core::time::Duration::from_secs(4))).into();
-            page_wait(&page, &Some(wait_for)).await;
-            page.content_bytes().await?
-        } else {
-            next_content
-        };
+                    *b = next_content;
+                }
+                _ => (),
+            }
+        })
+        .await;
 
-        *b = next_content;
+        match page_result {
+            Ok(_) => Ok(()),
+            _ => Err(chromiumoxide::error::CdpError::Timeout),
+        }
+    } else {
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Handle cloudflare protected pages via chrome. This does nothing without the real_browser feature enabled.
@@ -453,7 +468,7 @@ pub async fn perform_chrome_http_request(
                 _ => (),
             };
         }
-        _ => (),
+        Err(e) => return Err(e),
     }
 
     Ok(ChromeHTTPReqRes {
@@ -816,32 +831,35 @@ pub async fn fetch_page_html_chrome_base(
     automation_scripts: &Option<AutomationScripts>,
 ) -> Result<PageResponse, chromiumoxide::error::CdpError> {
     let mut chrome_http_req_res = ChromeHTTPReqRes::default();
+    let mut valid = false;
 
     let page = {
-        let page_result = tokio::time::timeout(tokio::time::Duration::from_secs(120), async {
-            {
-                // the active page was already set prior. No need to re-navigate or set the content.
-                if !page_set {
-                    // used for smart mode re-rendering direct assigning html
-                    if content {
-                        match page.set_content(source).await {
-                            Ok(p) => p,
-                            _ => page,
+        let page_result = tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+            // the active page was already set prior. No need to re-navigate or set the content.
+            if !page_set {
+                // used for smart mode re-rendering direct assigning html
+                if content {
+                    match page.set_content(source).await {
+                        Ok(p) => {
+                            valid = true;
+                            p
                         }
-                    } else {
-                        match perform_chrome_http_request(&page, source).await {
-                            Ok(chqr) => {
-                                chrome_http_req_res = chqr;
-                            }
-                            Err(e) => {
-                                log("HTTP Error: ", e.to_string());
-                            }
-                        };
-                        page
+                        _ => page,
                     }
                 } else {
+                    match perform_chrome_http_request(&page, source).await {
+                        Ok(chqr) => {
+                            valid = true;
+                            chrome_http_req_res = chqr;
+                        }
+                        Err(e) => {
+                            log("HTTP Error: ", e.to_string());
+                        }
+                    };
                     page
                 }
+            } else {
+                page
             }
         })
         .await;
@@ -850,6 +868,14 @@ pub async fn fetch_page_html_chrome_base(
             _ => page,
         }
     };
+
+    if !valid {
+        if cfg!(not(feature = "chrome_store_page")) {
+            page.execute(chromiumoxide::cdp::browser_protocol::page::CloseParams::default())
+                .await?;
+        }
+        return Err(chromiumoxide::error::CdpError::NoResponse);
+    }
 
     // we do not need to wait for navigation if content is assigned. The method set_content already handles this.
     let final_url = if wait_for_navigation && !content {
@@ -924,21 +950,27 @@ pub async fn fetch_page_html_chrome_base(
         ..Default::default()
     };
 
-    run_openai_request(
-        match url_target {
-            Some(ref ut) => ut,
-            _ => source,
-        },
-        page,
-        wait_for,
-        openai_config,
-        &mut page_response,
-        ok,
-    )
-    .await;
+    if openai_config.is_some() {
+        run_openai_request(
+            match url_target {
+                Some(ref ut) => ut,
+                _ => source,
+            },
+            page,
+            wait_for,
+            openai_config,
+            &mut page_response,
+            ok,
+        )
+        .await;
+    }
 
     if cfg!(feature = "chrome_screenshot") || screenshot.is_some() {
-        perform_screenshot(source, page, screenshot, &mut page_response).await;
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            perform_screenshot(source, page, screenshot, &mut page_response),
+        )
+        .await;
     }
 
     if !page_set && cfg!(feature = "cache_chrome_hybrid") {
@@ -1156,7 +1188,10 @@ pub async fn fetch_page_html_raw(target_url: &str, client: &Client) -> PageRespo
 
                         data.put(text)
                     }
-                    _ => (),
+                    Err(e) => {
+                        log::error!("{e} in {}", target_url);
+                        break;
+                    }
                 }
             }
 
@@ -1313,7 +1348,10 @@ pub async fn fetch_page_html(target_url: &str, client: &Client) -> PageResponse 
                             }
                         }
                     }
-                    _ => (),
+                    Err(e) => {
+                        log::error!("{e} in {}", target_url);
+                        break;
+                    }
                 }
             }
 
@@ -1461,7 +1499,10 @@ pub async fn fetch_page_html(
                                             }
                                         }
                                     }
-                                    _ => (),
+                                    Err(e) => {
+                                        log::error!("{e} in {}", target_url);
+                                        break;
+                                    }
                                 }
                             }
 
@@ -1607,7 +1648,10 @@ pub async fn fetch_page_html_chrome(
                                         }
                                         data.put(text)
                                     }
-                                    _ => (),
+                                    Err(e) => {
+                                        log::error!("{e} in {}", target_url);
+                                        break;
+                                    }
                                 }
                             }
 
